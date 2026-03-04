@@ -13,6 +13,47 @@ import (
 	"github.com/sipeed/picoclaw/pkg/fileutil"
 )
 
+const (
+	// maxReadFileSize defines the maximum allowed size (in bytes) for files
+	// that can be read through the read_file tool.
+	maxReadFileSize = 2 * 1024 * 1024 // 2MB
+
+	// binaryThreshold is the ratio of non-text bytes in a sample above which
+	// a file is treated as binary and therefore not readable as text.
+	binaryThreshold = 0.30
+)
+
+// allowedImageExtensions defines extensions that are treated as image/binary
+// payloads which are allowed to be read, but typically not rendered as text.
+var allowedImageExtensions = map[string]struct{}{
+	".png":  {},
+	".jpg":  {},
+	".jpeg": {},
+	".gif":  {},
+	".webp": {},
+}
+
+// disallowedBinaryExtensions defines extensions that are known to be binary or
+// archive formats which should not be read through the read_file tool.
+var disallowedBinaryExtensions = map[string]struct{}{
+	".exe":   {},
+	".dll":   {},
+	".so":    {},
+	".dylib": {},
+	".bin":   {},
+	".class": {},
+	".o":     {},
+	".a":     {},
+	".pdf":   {},
+	".zip":   {},
+	".tar":   {},
+	".gz":    {},
+	".tgz":   {},
+	".bz2":   {},
+	".7z":    {},
+	".xz":    {},
+}
+
 // validatePath ensures the given path is within the workspace if restrict is true.
 func validatePath(path, workspace string, restrict bool) (string, error) {
 	if workspace == "" {
@@ -251,15 +292,102 @@ type fileSystem interface {
 	ReadDir(path string) ([]os.DirEntry, error)
 }
 
+// isAllowedReadPath applies extension and size based validation before a file
+// is read. It is used by both hostFs and sandboxFs implementations.
+func isAllowedReadPath(path string, size int64) error {
+	ext := strings.ToLower(filepath.Ext(path))
+
+	if _, ok := allowedImageExtensions[ext]; ok {
+		if size > maxReadFileSize {
+			return fmt.Errorf("image too large (>%d bytes), reading is not allowed", maxReadFileSize)
+		}
+		return nil
+	}
+
+	if _, ok := disallowedBinaryExtensions[ext]; ok {
+		return fmt.Errorf("reading this binary file type is not allowed: %s", ext)
+	}
+
+	// Default: treat as text-like file, only enforce generic size limit.
+	if size > maxReadFileSize {
+		return fmt.Errorf("file too large (>%d bytes), reading is not allowed", maxReadFileSize)
+	}
+	return nil
+}
+
+// isLikelyBinary performs a lightweight heuristic to determine if the provided
+// sample is likely binary data instead of plain text.
+func isLikelyBinary(sample []byte) bool {
+	if len(sample) == 0 {
+		return false
+	}
+
+	var nonText int
+	for _, b := range sample {
+		// Allow common control characters for text files.
+		if b == '\n' || b == '\r' || b == '\t' {
+			continue
+		}
+		// Visible ASCII range.
+		if b >= 32 && b <= 126 {
+			continue
+		}
+		nonText++
+	}
+
+	return float64(nonText)/float64(len(sample)) > binaryThreshold
+}
+
 // hostFs is an unrestricted fileReadWriter that operates directly on the host filesystem.
 type hostFs struct{}
 
 func (h *hostFs) ReadFile(path string) ([]byte, error) {
-	content, err := os.ReadFile(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("failed to read file: file not found: %w", err)
 		}
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("failed to read file: access denied: %w", err)
+		}
+		return nil, fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	if err := isAllowedReadPath(path, info.Size()); err != nil {
+		return nil, err
+	}
+
+	// Sample a small prefix of the file to detect likely binary content.
+	const sampleSize = 8 * 1024
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("failed to read file: access denied: %w", err)
+		}
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer f.Close()
+
+	bufSize := sampleSize
+	if info.Size() < int64(sampleSize) {
+		bufSize = int(info.Size())
+	}
+
+	if bufSize > 0 {
+		sample := make([]byte, bufSize)
+		if _, err := f.Read(sample); err != nil && err.Error() != "EOF" {
+			return nil, fmt.Errorf("failed to read file sample: %w", err)
+		}
+
+		// Only perform binary detection for non-image types.
+		ext := strings.ToLower(filepath.Ext(path))
+		if _, isImage := allowedImageExtensions[ext]; !isImage && isLikelyBinary(sample) {
+			return nil, fmt.Errorf("binary or non-text files are not allowed to be read")
+		}
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
 		if os.IsPermission(err) {
 			return nil, fmt.Errorf("failed to read file: access denied: %w", err)
 		}
@@ -305,6 +433,53 @@ func (r *sandboxFs) execute(path string, fn func(root *os.Root, relPath string) 
 func (r *sandboxFs) ReadFile(path string) ([]byte, error) {
 	var content []byte
 	err := r.execute(path, func(root *os.Root, relPath string) error {
+		info, err := root.Stat(relPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("failed to read file: file not found: %w", err)
+			}
+			if os.IsPermission(err) {
+				return fmt.Errorf("failed to read file: access denied: %w", err)
+			}
+			return fmt.Errorf("failed to stat file: %w", err)
+		}
+
+		if err := isAllowedReadPath(path, info.Size()); err != nil {
+			return err
+		}
+
+		const sampleSize = 8 * 1024
+		f, err := root.Open(relPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("failed to read file: file not found: %w", err)
+			}
+			// os.Root returns "escapes from parent" for paths outside the root
+			if os.IsPermission(err) || strings.Contains(err.Error(), "escapes from parent") ||
+				strings.Contains(err.Error(), "permission denied") {
+				return fmt.Errorf("failed to read file: access denied: %w", err)
+			}
+			return fmt.Errorf("failed to open file: %w", err)
+		}
+		defer f.Close()
+
+		bufSize := sampleSize
+		if info.Size() < int64(sampleSize) {
+			bufSize = int(info.Size())
+		}
+
+		if bufSize > 0 {
+			sample := make([]byte, bufSize)
+			if _, err := f.Read(sample); err != nil && err.Error() != "EOF" {
+				return fmt.Errorf("failed to read file sample: %w", err)
+			}
+
+			ext := strings.ToLower(filepath.Ext(path))
+			if _, isImage := allowedImageExtensions[ext]; !isImage && isLikelyBinary(sample) {
+				return fmt.Errorf("binary or non-text files are not allowed to be read")
+			}
+		}
+
 		fileContent, err := root.ReadFile(relPath)
 		if err != nil {
 			if os.IsNotExist(err) {
