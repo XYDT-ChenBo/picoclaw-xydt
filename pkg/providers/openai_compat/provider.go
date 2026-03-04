@@ -3,6 +3,7 @@ package openai_compat
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -58,16 +59,29 @@ func NewProvider(apiKey, apiBase, proxy string, opts ...Option) *Provider {
 		Timeout: defaultRequestTimeout,
 	}
 
+	// 基于默认 Transport 克隆一份，这样可以保留环境变量代理等默认行为。
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
+	transport.TLSClientConfig.InsecureSkipVerify = true
+
 	if proxy != "" {
 		parsed, err := url.Parse(proxy)
 		if err == nil {
-			client.Transport = &http.Transport{
-				Proxy: http.ProxyURL(parsed),
-			}
+			transport.Proxy = http.ProxyURL(parsed)
 		} else {
 			log.Printf("openai_compat: invalid proxy URL %q: %v", proxy, err)
 		}
 	}
+
+	client.Transport = transport
 
 	p := &Provider{
 		apiKey:     apiKey,

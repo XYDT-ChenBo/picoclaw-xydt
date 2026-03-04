@@ -47,3 +47,11 @@ dist/
 
 # Windows Application Icon/Resource
 *.syso
+
+# cursor
+.cursorindexingignore
+.specstory/
+
+
+# picoclaw-node
+cmd/picoclaw-node/config.json

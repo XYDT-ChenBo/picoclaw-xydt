@@ -95,7 +95,7 @@ func (t *CronTool) Parameters() map[string]any {
 			},
 			"deliver": map[string]any{
 				"type":        "boolean",
-				"description": "If true, send message directly to channel. If false, let agent process message (for complex tasks). Default: true",
+				"description": "If true, send message directly to channel. If false, let agent process message (for complex tasks). Default: false",
 			},
 		},
 		"required": []string{"action"},
