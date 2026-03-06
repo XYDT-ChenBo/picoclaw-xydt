@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 // openAIChatMessage is a single message in an OpenAI chat completion request.
@@ -92,6 +94,15 @@ func buildPromptFromOpenAIMessages(messages []openAIChatMessage) (userMessage, e
 	}
 	extraSystemPrompt = strings.Join(systemParts, "\n\n")
 	return userMessage, extraSystemPrompt
+}
+
+// truncateForLog returns a shortened preview for logging without changing behaviour.
+func truncateForLog(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	// Simple byte-based truncation is sufficient for logs.
+	return s[:max] + "..."
 }
 
 // writeOpenAISSE writes one SSE event and flushes.
@@ -192,11 +203,20 @@ func (al *AgentLoop) NewOpenAIChatHandler(cfg OpenAIChatHandlerConfig) http.Hand
 		runID := newOpenAIRunID()
 		created := int64(time.Now().Unix())
 
-		// ── Run the agent (synchronous) ────────────────────────────────────
-		// Use "openai" as the channel so routing/history work naturally.
-		response, err := al.ProcessDirectWithChannel(r.Context(), userMessage, sessionKey, "openai", "api")
+		// ── Log inbound request / high-level interaction ────────────────────
+		logger.InfoCF("openai_http", "OpenAI /v1/chat/completions request",
+			map[string]any{
+				"model":          model,
+				"stream":         req.Stream,
+				"user":           req.User,
+				"session_key":    sessionKey,
+				"user_message":   truncateForLog(userMessage, 512),
+				"remote_addr":    r.RemoteAddr,
+				"user_agent":     r.UserAgent(),
+				"messages_count": len(req.Messages),
+			})
 
-		// ── Streaming response (SSE) ────────────────────────────────────────
+		// ── Streaming response (SSE, true streaming) ────────────────────────
 		if req.Stream {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
@@ -204,30 +224,72 @@ func (al *AgentLoop) NewOpenAIChatHandler(cfg OpenAIChatHandlerConfig) http.Hand
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(http.StatusOK)
 
-			if err != nil {
-				// Emit the error as content and finish cleanly.
-				writeOpenAISSE(w, buildChunk(runID, model, created,
-					map[string]any{"role": "assistant", "content": fmt.Sprintf("Error: %v", err)},
-					ptrStr("stop")))
-				writeOpenAIDone(w)
-				return
-			}
+			logger.InfoCF("openai_http", "Starting streaming agent run",
+				map[string]any{
+					"model":       model,
+					"session_key": sessionKey,
+					"run_id":      runID,
+				})
 
 			// 1) role chunk
 			writeOpenAISSE(w, buildChunk(runID, model, created,
 				map[string]any{"role": "assistant"}, nil))
 
-			// 2) content chunk
-			writeOpenAISSE(w, buildChunk(runID, model, created,
-				map[string]any{"content": response}, nil))
+			var streamedContent strings.Builder
+			streamOut := func(chunk string) {
+				if chunk != "" {
+					streamedContent.WriteString(chunk)
+					logger.DebugCF("openai_http", "Stream chunk",
+						map[string]any{"chunk": chunk, "run_id": runID})
+					writeOpenAISSE(w, buildChunk(runID, model, created,
+						map[string]any{"content": chunk}, nil))
+				}
+			}
+			_, err := al.ProcessDirectWithChannelStream(r.Context(), userMessage, sessionKey, "openai", "api", streamOut)
 
-			// 3) finish chunk
+			fullOutput := streamedContent.String()
+			logger.InfoCF("openai_http", "Streaming response body",
+				map[string]any{
+					"model":       model,
+					"session_key": sessionKey,
+					"run_id":      runID,
+					"output":      truncateForLog(fullOutput, 2048),
+					"output_len":  len(fullOutput),
+				})
+
+			if err != nil {
+				logger.ErrorCF("openai_http", "Streaming agent run failed",
+					map[string]any{
+						"model":       model,
+						"session_key": sessionKey,
+						"run_id":      runID,
+						"error":       err.Error(),
+					})
+				writeOpenAISSE(w, buildChunk(runID, model, created,
+					map[string]any{"content": fmt.Sprintf("Error: %v", err)},
+					nil))
+			} else {
+				logger.InfoCF("openai_http", "Streaming agent run completed",
+					map[string]any{
+						"model":       model,
+						"session_key": sessionKey,
+						"run_id":      runID,
+					})
+			}
 			writeOpenAISSE(w, buildChunk(runID, model, created,
 				map[string]any{}, ptrStr("stop")))
-
 			writeOpenAIDone(w)
 			return
 		}
+
+		// ── Non-streaming: run the agent (synchronous) ───────────────────────
+		logger.InfoCF("openai_http", "Starting non-streaming agent run",
+			map[string]any{
+				"model":       model,
+				"session_key": sessionKey,
+				"run_id":      runID,
+			})
+		response, err := al.ProcessDirectWithChannel(r.Context(), userMessage, sessionKey, "openai", "api")
 
 		// ── Non-streaming JSON response ─────────────────────────────────────
 		w.Header().Set("Content-Type", "application/json")
@@ -300,5 +362,3 @@ func buildChunk(id, model string, created int64, delta map[string]any, finishRea
 }
 
 func ptrStr(s string) *string { return &s }
-
-

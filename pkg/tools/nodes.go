@@ -413,7 +413,8 @@ func (t *NodesTool) Execute(_ context.Context, args map[string]any) *ToolResult 
 		}
 		facing, _ := args["facing"].(string)
 		if facing == "" {
-			facing = "both"
+			// Default to front camera only when not specified.
+			facing = "front"
 		}
 		facings := []string{}
 		switch facing {

@@ -59,6 +59,9 @@ type processOptions struct {
 	EnableSummary   bool     // Whether to trigger summarization
 	SendResponse    bool     // Whether to send response via bus
 	NoHistory       bool     // If true, don't load session history (for heartbeat)
+	// StreamCallback, when set, is called with each content delta from the LLM (true streaming).
+	// Only used when the provider supports it and there is no fallback chain.
+	StreamCallback func(string)
 }
 
 const defaultResponse = "I've completed processing but have no response to give. Increase `max_tool_iterations` in config.json."
@@ -419,6 +422,50 @@ func (al *AgentLoop) ProcessDirectWithChannel(
 	}
 
 	return al.processMessage(ctx, msg)
+}
+
+// ProcessDirectWithChannelStream runs the same pipeline as ProcessDirectWithChannel but
+// calls streamOut with each content delta from the LLM (true streaming). Only effective
+// when the configured provider supports streaming (e.g. openai_compat with stream_callback).
+func (al *AgentLoop) ProcessDirectWithChannelStream(
+	ctx context.Context,
+	content, sessionKey, channel, chatID string,
+	streamOut func(string),
+) (string, error) {
+	route := al.registry.ResolveRoute(routing.RouteInput{
+		Channel: channel,
+	})
+	agent, ok := al.registry.GetAgent(route.AgentID)
+	if !ok {
+		agent = al.registry.GetDefaultAgent()
+	}
+	if agent == nil {
+		return "", fmt.Errorf("no agent available for route (agent_id=%s)", route.AgentID)
+	}
+	sessKey := route.SessionKey
+	if sessionKey != "" && strings.HasPrefix(sessionKey, "agent:") {
+		sessKey = sessionKey
+	}
+
+	preview := utils.Truncate(content, 80)
+	logger.InfoCF("agent", "ProcessDirectWithChannelStream",
+		map[string]any{
+			"channel":        channel,
+			"chat_id":        chatID,
+			"session_key":    sessKey,
+			"content_preview": preview,
+		})
+
+	return al.runAgentLoop(ctx, agent, processOptions{
+		SessionKey:      sessKey,
+		Channel:         channel,
+		ChatID:          chatID,
+		UserMessage:     content,
+		DefaultResponse: defaultResponse,
+		EnableSummary:   false,
+		SendResponse:    false,
+		StreamCallback:  streamOut,
+	})
 }
 
 // ProcessHeartbeat processes a heartbeat request without session history.
@@ -783,22 +830,29 @@ func (al *AgentLoop) runLLMIteration(
 		var response *providers.LLMResponse
 		var err error
 
+		llmOptions := map[string]any{
+			"max_tokens":       agent.MaxTokens,
+			"temperature":      agent.Temperature,
+			"prompt_cache_key": agent.ID,
+		}
+		// True streaming: pass stream_callback so provider can emit deltas (used in both direct and fallback paths).
+		if opts.StreamCallback != nil {
+			llmOptions["stream_callback"] = opts.StreamCallback
+		}
+
 		callLLM := func() (*providers.LLMResponse, error) {
 			if len(agent.Candidates) > 1 && al.fallback != nil {
 				fbResult, fbErr := al.fallback.Execute(
 					ctx,
 					agent.Candidates,
 					func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
+						// Use llmOptions (includes stream_callback when set) so the winning candidate can stream.
 						return agent.Provider.Chat(
 							ctx,
 							messages,
 							providerToolDefs,
 							model,
-							map[string]any{
-								"max_tokens":       agent.MaxTokens,
-								"temperature":      agent.Temperature,
-								"prompt_cache_key": agent.ID,
-							},
+							llmOptions,
 						)
 					},
 				)
@@ -815,11 +869,7 @@ func (al *AgentLoop) runLLMIteration(
 				}
 				return fbResult.Response, nil
 			}
-			return agent.Provider.Chat(ctx, messages, providerToolDefs, agent.Model, map[string]any{
-				"max_tokens":       agent.MaxTokens,
-				"temperature":      agent.Temperature,
-				"prompt_cache_key": agent.ID,
-			})
+			return agent.Provider.Chat(ctx, messages, providerToolDefs, agent.Model, llmOptions)
 		}
 
 		// Retry loop for context/token errors

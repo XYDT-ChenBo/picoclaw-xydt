@@ -1,6 +1,7 @@
 package openai_compat
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -176,6 +177,16 @@ func (p *Provider) Chat(
 		}
 	}
 
+	// Optional: true streaming — stream_callback receives each content delta from the API.
+	if cb, ok := options["stream_callback"].(func(string)); ok && cb != nil {
+		requestBody["stream"] = true
+		jsonData, err := json.Marshal(requestBody)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal request: %w", err)
+		}
+		return p.chatStream(ctx, jsonData, cb)
+	}
+
 	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
@@ -207,6 +218,154 @@ func (p *Provider) Chat(
 	}
 
 	return parseResponse(body)
+}
+
+// chatStream performs a streaming chat/completions request, calls streamCallback
+// for each content delta, and returns the full LLMResponse (content + tool_calls) from the stream.
+func (p *Provider) chatStream(ctx context.Context, jsonData []byte, streamCallback func(string)) (*LLMResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/chat/completions", bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API request failed:\n  Status: %d\n  Body:   %s", resp.StatusCode, string(body))
+	}
+
+	// Upstream returned non-streaming JSON (e.g. proxy or API ignores stream=true).
+	// Emit the full content as one chunk so the client still gets correct output.
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "application/json") {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("reading non-streaming response: %w", err)
+		}
+		res, err := parseResponse(body)
+		if err != nil {
+			return nil, err
+		}
+		if res.Content != "" {
+			streamCallback(res.Content)
+		}
+		return res, nil
+	}
+
+	var fullContent strings.Builder
+	var toolCallsAccum []streamToolCallAccum
+	finishReason := "stop"
+
+	scanner := bufio.NewScanner(resp.Body)
+	// SSE lines can be longer than default 64K
+	const maxLine = 1024 * 1024
+	buf := make([]byte, 0, 4096)
+	scanner.Buffer(buf, maxLine)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		payload = strings.TrimSpace(payload)
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		var event struct {
+			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					Role     string `json:"role"`
+					ToolCalls []struct {
+						Index    int `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function *struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			continue
+		}
+		if len(event.Choices) == 0 {
+			continue
+		}
+		choice := event.Choices[0]
+		if choice.Delta.Content != "" {
+			fullContent.WriteString(choice.Delta.Content)
+			streamCallback(choice.Delta.Content)
+		}
+		for _, tc := range choice.Delta.ToolCalls {
+			idx := tc.Index
+			for len(toolCallsAccum) <= idx {
+				toolCallsAccum = append(toolCallsAccum, streamToolCallAccum{})
+			}
+			acc := &toolCallsAccum[idx]
+			if tc.ID != "" {
+				acc.ID = tc.ID
+			}
+			if tc.Function != nil {
+				if tc.Function.Name != "" {
+					acc.Name = tc.Function.Name
+				}
+				acc.Arguments.WriteString(tc.Function.Arguments)
+			}
+		}
+		if choice.FinishReason != "" {
+			finishReason = choice.FinishReason
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading stream: %w", err)
+	}
+
+	toolCalls := make([]ToolCall, 0, len(toolCallsAccum))
+	for _, acc := range toolCallsAccum {
+		if acc.Name == "" && acc.Arguments.Len() == 0 {
+			continue
+		}
+		arguments := make(map[string]any)
+		if acc.Arguments.Len() > 0 {
+			if err := json.Unmarshal(acc.Arguments.Bytes(), &arguments); err != nil {
+				arguments["raw"] = acc.Arguments.String()
+			}
+		}
+		toolCalls = append(toolCalls, ToolCall{
+			ID:        acc.ID,
+			Name:      acc.Name,
+			Arguments: arguments,
+		})
+	}
+
+	return &LLMResponse{
+		Content:      fullContent.String(),
+		ToolCalls:    toolCalls,
+		FinishReason: finishReason,
+	}, nil
+}
+
+type streamToolCallAccum struct {
+	ID        string
+	Name      string
+	Arguments bytes.Buffer
 }
 
 func parseResponse(body []byte) (*LLMResponse, error) {
