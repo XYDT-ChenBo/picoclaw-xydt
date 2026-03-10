@@ -132,7 +132,7 @@ func (t *NodesTool) Parameters() map[string]any {
 			// camera_snap / camera_clip
 			"facing": map[string]any{
 				"type":        "string",
-				"description": "Camera facing: front | back | both (camera_snap: all three,default is front; camera_clip: front|back only).",
+				"description": "Camera facing: front | back | both (camera_snap: default front, one photo; both = front+back two photos; camera_clip: front|back only).",
 				"enum":        []string{"front", "back", "both"},
 			},
 			"maxWidth": map[string]any{
