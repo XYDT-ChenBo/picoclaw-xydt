@@ -217,6 +217,7 @@ type ChannelsConfig struct {
 	WeComApp   WeComAppConfig   `json:"wecom_app"`
 	WeComAIBot WeComAIBotConfig `json:"wecom_aibot"`
 	Pico       PicoConfig       `json:"pico"`
+	BotService BotServiceConfig `json:"bot_service"`
 }
 
 // GroupTriggerConfig controls when the bot responds in group chats.
@@ -398,6 +399,19 @@ type PicoConfig struct {
 	MaxConnections  int                 `json:"max_connections,omitempty"`
 	AllowFrom       FlexibleStringSlice `json:"allow_from"                  env:"PICOCLAW_CHANNELS_PICO_ALLOW_FROM"`
 	Placeholder     PlaceholderConfig   `json:"placeholder,omitempty"`
+}
+
+// BotServiceConfig configures the BotService (iCenter-style) WebSocket channel.
+// It connects to an external WebSocket service, receives inbound messages, and
+// sends replies back via the same connection.
+type BotServiceConfig struct {
+	Enabled            bool                `json:"enabled"                 env:"PICOCLAW_CHANNELS_BOTSERVICE_ENABLED"`
+	WSURL              string              `json:"ws_url"                  env:"PICOCLAW_CHANNELS_BOTSERVICE_WS_URL"`
+	SecretKey          string              `json:"secret_key,omitempty"    env:"PICOCLAW_CHANNELS_BOTSERVICE_SECRET_KEY"`
+	AccountID          string              `json:"account_id,omitempty"    env:"PICOCLAW_CHANNELS_BOTSERVICE_ACCOUNT_ID"`
+	AllowFrom          FlexibleStringSlice `json:"allow_from"              env:"PICOCLAW_CHANNELS_BOTSERVICE_ALLOW_FROM"`
+	GroupTrigger       GroupTriggerConfig  `json:"group_trigger,omitempty"`
+	ReasoningChannelID string              `json:"reasoning_channel_id"    env:"PICOCLAW_CHANNELS_BOTSERVICE_REASONING_CHANNEL_ID"`
 }
 
 type HeartbeatConfig struct {

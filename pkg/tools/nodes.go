@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -225,7 +226,7 @@ func (t *NodesTool) Parameters() map[string]any {
 			},
 			"invokeParamsJson": map[string]any{
 				"type":        "string",
-				"description": "JSON object string for invoke params, e.g. {\"facing\":\"front\"}. Empty or omitted = {}.",
+				"description": "JSON object string for invoke params, e.g. {\"facing\":\"front\"}. For cast.autoCast to a specific device, pass {\"devicename\": \"设备名\"} (e.g. {\"devicename\": \"中兴云自由屏\"}) to improve success and avoid retries. Empty or omitted = {}.",
 			},
 			// canvas_present
 			"url": map[string]any{
@@ -411,11 +412,16 @@ func (t *NodesTool) Execute(_ context.Context, args map[string]any) *ToolResult 
 		if err != nil {
 			return ErrorResult(err.Error())
 		}
+		actionStart := time.Now()
+		// 默认只拍前置相机；如需前后都拍，显式传 facing="both"。
 		facing, _ := args["facing"].(string)
 		if facing == "" {
-			// Default to front camera only when not specified.
 			facing = "front"
 		}
+		log.Printf("nodes: camera_snap start node=%s facing=%s timeoutMs=%d", nodeID, facing, timeoutMs)
+		defer func() {
+			log.Printf("nodes: camera_snap done node=%s totalMs=%d", nodeID, time.Since(actionStart).Milliseconds())
+		}()
 		facings := []string{}
 		switch facing {
 		case "front", "back":
@@ -448,18 +454,25 @@ func (t *NodesTool) Execute(_ context.Context, args map[string]any) *ToolResult 
 
 		for _, f := range facings {
 			p["facing"] = f
+			invokeStart := time.Now()
+			log.Printf("nodes: camera_snap invoke start node=%s facing=%s timeoutMs=%d", nodeID, f, timeoutMs)
 			res := t.registry.Invoke(nodeID, "camera.snap", p, timeoutMs)
 			if !res.Ok {
+				log.Printf("nodes: camera_snap invoke error node=%s facing=%s elapsedMs=%d err=%s", nodeID, f, time.Since(invokeStart).Milliseconds(), invokeErrMsg(res))
 				return ErrorResult(fmt.Sprintf("camera.snap facing=%s: %s", f, invokeErrMsg(res)))
 			}
+			log.Printf("nodes: camera_snap invoke ok node=%s facing=%s elapsedMs=%d", nodeID, f, time.Since(invokeStart).Milliseconds())
+			decodeStart := time.Now()
 			payload, err := decodePayload(res)
 			if err != nil {
+				log.Printf("nodes: camera_snap decode error node=%s facing=%s elapsedMs=%d err=%v", nodeID, f, time.Since(decodeStart).Milliseconds(), err)
 				return ErrorResult(fmt.Sprintf("camera.snap parse: %v", err))
 			}
 			b64, _ := payload["base64"].(string)
 			if b64 == "" {
 				return ErrorResult("camera.snap: empty base64 in response")
 			}
+			decodeB64Start := time.Now()
 			imgBytes, err := base64.StdEncoding.DecodeString(b64)
 			if err != nil {
 				imgBytes, err = base64.RawStdEncoding.DecodeString(b64)
@@ -467,6 +480,8 @@ func (t *NodesTool) Execute(_ context.Context, args map[string]any) *ToolResult 
 					return ErrorResult("camera.snap: base64 decode failed")
 				}
 			}
+			log.Printf("nodes: camera_snap decode_base64_ok node=%s facing=%s bytes=%d elapsedMs=%d", nodeID, f, len(imgBytes), time.Since(decodeB64Start).Milliseconds())
+			fileStart := time.Now()
 			path := t.tempMediaPath("snap", f, "jpg")
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				return ErrorResult(fmt.Sprintf("camera.snap: mkdir: %v", err))
@@ -474,6 +489,7 @@ func (t *NodesTool) Execute(_ context.Context, args map[string]any) *ToolResult 
 			if err := os.WriteFile(path, imgBytes, 0o644); err != nil {
 				return ErrorResult(fmt.Sprintf("camera.snap: write file: %v", err))
 			}
+			log.Printf("nodes: camera_snap file_saved node=%s facing=%s path=%s elapsedMs=%d", nodeID, f, path, time.Since(fileStart).Milliseconds())
 			results = append(results, snapResult{
 				facing: f,
 				path:   path,

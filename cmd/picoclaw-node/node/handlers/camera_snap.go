@@ -29,9 +29,17 @@ func NewCameraSnapHandler(cfg config.ExecConfig) *CameraSnapHandler {
 }
 
 func (h *CameraSnapHandler) Handle(req gateway.InvokeRequest) gateway.InvokeResult {
+	start := time.Now()
+	log.Printf("go_node: camera.snap start")
+	defer func() {
+		log.Printf("go_node: camera.snap done, totalMs=%d", time.Since(start).Milliseconds())
+	}()
+
 	// 1. snapshotSrc 目录来自 config.json 的 exec.workDir，文件名按时间命名
+	stepStart := time.Now()
 	snapshotSrc := h.buildSnapshotPath()
 	if err := os.MkdirAll(filepath.Dir(snapshotSrc), 0o755); err != nil {
+		log.Printf("go_node: camera.snap error stage=create_workDir dir=%s err=%v elapsedMs=%d", filepath.Dir(snapshotSrc), err, time.Since(start).Milliseconds())
 		return gateway.InvokeResult{
 			OK: false,
 			Error: &gateway.ErrorShape{
@@ -40,10 +48,13 @@ func (h *CameraSnapHandler) Handle(req gateway.InvokeRequest) gateway.InvokeResu
 			},
 		}
 	}
+	log.Printf("go_node: camera.snap stage=create_workDir_ok dir=%s elapsedMs=%d", filepath.Dir(snapshotSrc), time.Since(stepStart).Milliseconds())
 	width, height := 640, 360
 
+	cmdStart := time.Now()
 	cmd := exec.Command("sendcmd", "avserver..snapshot", "start", snapshotSrc, "640", "360")
 	if err := cmd.Run(); err != nil {
+		log.Printf("go_node: camera.snap error stage=sendcmd err=%v elapsedMs=%d", err, time.Since(cmdStart).Milliseconds())
 		return gateway.InvokeResult{
 			OK: false,
 			Error: &gateway.ErrorShape{
@@ -52,8 +63,7 @@ func (h *CameraSnapHandler) Handle(req gateway.InvokeRequest) gateway.InvokeResu
 			},
 		}
 	}
-
-	log.Printf("go_node: camera.snap command success, snapshot path=%s", snapshotSrc)
+	log.Printf("go_node: camera.snap stage=sendcmd_ok snapshotPath=%s elapsedMs=%d", snapshotSrc, time.Since(cmdStart).Milliseconds())
 
 	// 2. snapshotSrc 已位于 exec.workDir，直接读取即可
 	destPath := snapshotSrc
@@ -61,10 +71,13 @@ func (h *CameraSnapHandler) Handle(req gateway.InvokeRequest) gateway.InvokeResu
 	// 3. 从 exec.workDir 下读取图片文件并返回
 	// 某些设备上 sendcmd 返回后文件落盘可能存在轻微延迟，这里增加短暂重试以提高稳定性。
 	var (
-		data    []byte
-		readErr error
+		data     []byte
+		readErr  error
+		attempts int
 	)
+	readStart := time.Now()
 	for i := 0; i < 20; i++ {
+		attempts = i + 1
 		data, readErr = os.ReadFile(destPath)
 		if readErr == nil {
 			break
@@ -72,6 +85,7 @@ func (h *CameraSnapHandler) Handle(req gateway.InvokeRequest) gateway.InvokeResu
 		time.Sleep(100 * time.Millisecond)
 	}
 	if readErr != nil {
+		log.Printf("go_node: camera.snap error stage=read_file path=%s attempts=%d elapsedMs=%d err=%v", destPath, attempts, time.Since(readStart).Milliseconds(), readErr)
 		return gateway.InvokeResult{
 			OK: false,
 			Error: &gateway.ErrorShape{
@@ -80,6 +94,7 @@ func (h *CameraSnapHandler) Handle(req gateway.InvokeRequest) gateway.InvokeResu
 			},
 		}
 	}
+	log.Printf("go_node: camera.snap stage=read_file_ok path=%s attempts=%d elapsedMs=%d", destPath, attempts, time.Since(readStart).Milliseconds())
 
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(destPath), "."))
 	if ext == "" {
@@ -89,8 +104,11 @@ func (h *CameraSnapHandler) Handle(req gateway.InvokeRequest) gateway.InvokeResu
 		ext = "jpg"
 	}
 
+	encodeStart := time.Now()
 	b64 := base64.StdEncoding.EncodeToString(data)
-	log.Printf("go_node: camera.snap path=%s bytes=%d width=%d height=%d", destPath, len(data), width, height)
+	encodeMs := time.Since(encodeStart).Milliseconds()
+	totalMs := time.Since(start).Milliseconds()
+	log.Printf("go_node: camera.snap done path=%s bytes=%d width=%d height=%d encodeMs=%d totalMs=%d", destPath, len(data), width, height, encodeMs, totalMs)
 
 	out := map[string]any{
 		"format": ext,

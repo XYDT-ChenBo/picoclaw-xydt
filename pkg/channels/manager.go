@@ -267,6 +267,10 @@ func (m *Manager) initChannels() error {
 		m.initChannel("pico", "Pico")
 	}
 
+	if m.config.Channels.BotService.Enabled && m.config.Channels.BotService.WSURL != "" {
+		m.initChannel("bot_service", "BotService")
+	}
+
 	logger.InfoCF("channels", "Channel initialization completed", map[string]any{
 		"enabled_channels": len(m.channels),
 	})
